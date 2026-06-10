@@ -83,10 +83,35 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	// Fiber's static middleware calls c.Next() for paths with no matching file,
 	// so /api/*, /health, /metrics, /swagger all pass through to their handlers.
 	uiFS, _ := fs.Sub(public.StaticFS, "ui")
-	app.Use("/", static.New("", static.Config{
+	uiHandler := static.New("", static.Config{
 		FS:         uiFS,
 		IndexNames: []string{"index.html"},
-	}))
+	})
+	// Cache policy for the embedded UI. The dashboard is shipped via go:embed,
+	// whose files carry a zero ModTime — so without an explicit Cache-Control
+	// browsers fall back to heuristic caching and pin the HTML for an
+	// effectively unbounded time. After a UI rebuild (`make update-ui`) the
+	// Next.js buildId changes and the previous chunk files are deleted, so a
+	// stale cached index.html keeps requesting now-missing chunks: hydration
+	// never completes and the page is frozen on the "connecting…" splash.
+	// We therefore forbid storing HTML documents (re-fetched every load, cheap
+	// — the heavy bundles are elsewhere), while the content-hashed
+	// /_next/static bundles are marked immutable since their names change on
+	// every build. Non-UI routes are left untouched so their handlers keep
+	// full control of their own response headers.
+	app.Use("/", func(c fiber.Ctx) error {
+		switch p := c.Path(); {
+		case strings.HasPrefix(p, "/_next/static/"):
+			c.Set("Cache-Control", "public, max-age=31536000, immutable")
+		case strings.HasPrefix(p, "/api"),
+			strings.HasPrefix(p, "/swagger"),
+			p == "/health", p == "/metrics", p == "/server-info":
+			// pass through to API / system handlers, untouched
+		default:
+			c.Set("Cache-Control", "no-store")
+		}
+		return uiHandler(c)
+	})
 
 	// Bearer auth with user store
 	if !cfg.NoAuth && (len(cfg.APIKeys) > 0 || cfg.UserStore != nil) {
